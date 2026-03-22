@@ -85,6 +85,16 @@ struct FileEvent {
     usn: i64,
 }
 
+/// USN Record from journal
+#[derive(Debug, Clone)]
+struct UsnRecord {
+    frn: u64,
+    parent_frn: u64,
+    usn: i64,
+    reason: u32,
+    filename: String,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -142,9 +152,11 @@ fn cmd_scan(bootstrap_path: PathBuf, baseline_path: PathBuf, output_path: PathBu
         CachedBaseline::default()
     };
     
+    let start = Instant::now();
     let records = read_usn_deltas(&bootstrap.volume_path, baseline.last_usn)?;
+    let read_time = start.elapsed();
     
-    println!("Read {} USN records", records.len());
+    println!("Read {} USN records in {:.1}ms", records.len(), read_time.as_secs_f64() * 1000.0);
     
     let events = process_records(records, &mut baseline, &bootstrap.scan_root)?;
     
@@ -180,70 +192,123 @@ fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
     println!("Test files: {}", count);
     println!();
     
+    // Cleanup previous test
     let _ = std::fs::remove_dir_all(&test_dir);
     std::fs::create_dir_all(&test_dir)?;
     
-    println!("Creating {} test files...", count);
+    // Phase 1: Create test files
+    println!("[1/5] Creating {} test files...", count);
     let start = Instant::now();
     for i in 0..count {
         let file_path = test_dir.join(format!("file_{}.txt", i));
         std::fs::write(&file_path, format!("content {}", i))?;
     }
     let create_time = start.elapsed();
-    println!("  Created in {:.2}s", create_time.as_secs_f64());
+    println!("      Created in {:.2}s", create_time.as_secs_f64());
     
-    println!("\nSimulating FULL scan (directory walk)...");
+    // Phase 2: Full directory walk
+    println!("\n[2/5] FULL scan (directory walk)...");
     let start = Instant::now();
     let mut full_scan_count = 0;
-    
-    fn walk_dir(dir: &Path, count: &mut usize) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                *count += 1;
-                if path.is_dir() {
-                    walk_dir(&path, count);
-                }
-            }
-        }
-    }
-    
-    walk_dir(&test_dir, &mut full_scan_count);
-    std::thread::sleep(std::time::Duration::from_millis((count / 100) as u64));
-    
+    walk_directory(&test_dir, &mut full_scan_count)?;
     let full_scan_time = start.elapsed();
-    println!("  Files scanned: {}", full_scan_count);
-    println!("  Time: {:.2}s", full_scan_time.as_secs_f64());
+    println!("      Files scanned: {}", full_scan_count);
+    println!("      Time: {:.2}s", full_scan_time.as_secs_f64());
     
+    // Phase 3: Create bootstrap and baseline
+    println!("\n[3/5] Creating bootstrap (USN journal cursor)...");
     let bootstrap_path = test_dir.join("bootstrap.json");
     cmd_bootstrap(test_dir.clone(), bootstrap_path.clone())?;
     
-    let modify_count = count / 100;
-    println!("\nModifying {} files (1% churn)...", modify_count);
+    // Create baseline by doing a full scan
+    println!("      Creating baseline cache...");
+    let baseline_path = test_dir.join("baseline.json");
+    cmd_scan(bootstrap_path.clone(), baseline_path.clone(), test_dir.join("events_init.jsonl"))?;
+    
+    // Phase 4: Modify files (1% churn)
+    let modify_count = count.max(100) / 100;
+    println!("\n[4/5] Modifying {} files (1% churn)...", modify_count);
     for i in 0..modify_count {
         let file_path = test_dir.join(format!("file_{}.txt", i));
         std::fs::write(&file_path, format!("modified content {}", i))?;
     }
+    println!("      Done");
     
-    println!("\nSimulating INCREMENTAL scan (USN journal)...");
-    let incremental_time = std::time::Duration::from_millis(50);
-    println!("  Time: {:.0}ms", incremental_time.as_millis());
+    // Phase 5: REAL incremental scan using USN journal
+    println!("\n[5/5] INCREMENTAL scan (USN journal)...");
+    let start = Instant::now();
+    let events_before = count_events(&test_dir.join("events_before.jsonl"))?;
+    cmd_scan(bootstrap_path.clone(), baseline_path.clone(), test_dir.join("events_before.jsonl"))?;
+    let incremental_time = start.elapsed();
+    let events_after = count_events(&test_dir.join("events_before.jsonl"))?;
+    let new_events = events_after.saturating_sub(events_before);
     
-    let reduction = (1.0 - (incremental_time.as_secs_f64() / full_scan_time.as_secs_f64())) * 100.0;
-    println!("\nResults:");
-    println!("  Full scan:     {:.2}s", full_scan_time.as_secs_f64());
-    println!("  Incremental:   {}ms", incremental_time.as_millis());
-    println!("  Reduction:     {:.1}%", reduction);
+    println!("      Journal records read: {}", new_events);
+    println!("      Time: {:.1}ms", incremental_time.as_secs_f64() * 1000.0);
+    
+    // Results
+    println!("\n==============================");
+    println!("RESULTS");
+    println!("==============================");
+    println!();
+    println!("Full Directory Walk:  {:.2}s (scanned {} files)", full_scan_time.as_secs_f64(), full_scan_count);
+    println!("USN Journal Scan:     {:.1}ms (read {} deltas)", incremental_time.as_secs_f64() * 1000.0, new_events);
+    
+    let reduction = if full_scan_time.as_secs_f64() > 0.0 {
+        (1.0 - (incremental_time.as_secs_f64() / full_scan_time.as_secs_f64())) * 100.0
+    } else {
+        0.0
+    };
+    
+    println!("Performance Gain:     {:.1}% faster", reduction);
+    println!();
     
     if reduction >= 80.0 {
-        println!("\n✅ PASS: >= 80% latency reduction achieved!");
+        println!("✅ PASS: >= 80% latency reduction achieved!");
     } else {
-        println!("\n⚠️  Below 80% target");
+        println!("⚠️  Result: {:.1}% reduction", reduction);
     }
     
+    // Show sample events
+    if let Ok(events) = std::fs::read_to_string(test_dir.join("events_before.jsonl")) {
+        let lines: Vec<&str> = events.lines().collect();
+        if !lines.is_empty() {
+            println!("\nSample detected changes:");
+            for (i, line) in lines.iter().take(3).enumerate() {
+                println!("  {}: {}", i + 1, line);
+            }
+            if lines.len() > 3 {
+                println!("  ... and {} more", lines.len() - 3);
+            }
+        }
+    }
+    
+    // Cleanup
+    println!("\nCleaning up...");
     std::fs::remove_dir_all(&test_dir)?;
+    println!("Done!");
     
     Ok(())
+}
+
+fn walk_directory(dir: &Path, count: &mut usize) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        *count += 1;
+        if path.is_dir() {
+            walk_directory(&path, count)?;
+        }
+    }
+    Ok(())
+}
+
+fn count_events(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let content = std::fs::read_to_string(path)?;
+    Ok(content.lines().count())
 }
 
 #[cfg(windows)]
@@ -312,9 +377,137 @@ fn query_usn_journal(volume: &str) -> Result<(u64, i64)> {
 }
 
 #[cfg(windows)]
-fn read_usn_deltas(_volume: &str, _start_usn: i64) -> Result<Vec<UsnRecord>> {
-    println!("Reading USN deltas (placeholder - full implementation on Windows)");
-    Ok(vec![])
+fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
+    use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::um::ioapiset::DeviceIoControl;
+    use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
+    use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ};
+    
+    const FSCTL_READ_USN_JOURNAL: u32 = 0x000900bb;
+    const MAX_USN_RECORD_SIZE: usize = 65536;
+    
+    #[repr(C)]
+    struct ReadUsnJournalData {
+        start_usn: i64,
+        reason_mask: u32,
+        return_only_on_close: u32,
+        timeout: u64,
+        bytes_to_wait_for: u64,
+        usn_journal_id: u64,
+    }
+    
+    #[repr(C, packed)]
+    struct UsnRecordV2 {
+        record_length: u32,
+        major_version: u16,
+        minor_version: u16,
+        file_reference_number: u64,
+        parent_file_reference_number: u64,
+        usn: i64,
+        time_stamp: i64,
+        reason: u32,
+        source_info: u32,
+        security_id: u32,
+        file_attributes: u32,
+        file_name_length: u16,
+        file_name_offset: u16,
+    }
+    
+    let volume_path: Vec<u16> = format!("\\\\.\\{}:", volume.trim_end_matches(':'))
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    
+    unsafe {
+        let handle = CreateFileW(
+            volume_path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        );
+        
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(anyhow::anyhow!("Failed to open volume {}"));
+        }
+        
+        // Get journal ID first
+        let (journal_id, _) = query_usn_journal(volume)?;
+        
+        let read_data = ReadUsnJournalData {
+            start_usn,
+            reason_mask: 0xFFFFFFFF, // All reasons
+            return_only_on_close: 0,
+            timeout: 0,
+            bytes_to_wait_for: 0,
+            usn_journal_id: journal_id,
+        };
+        
+        let mut buffer: Vec<u8> = vec![0; MAX_USN_RECORD_SIZE];
+        let mut bytes_returned: u32 = 0;
+        
+        let result = DeviceIoControl(
+            handle,
+            FSCTL_READ_USN_JOURNAL,
+            &read_data as *const _ as *mut _,
+            std::mem::size_of::<ReadUsnJournalData>() as u32,
+            buffer.as_mut_ptr() as *mut _,
+            buffer.len() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        );
+        
+        winapi::um::handleapi::CloseHandle(handle);
+        
+        if result == 0 {
+            // No new records is OK
+            return Ok(vec![]);
+        }
+        
+        // Parse USN records from buffer
+        let mut records = Vec::new();
+        let mut offset = 0;
+        
+        while offset + std::mem::size_of::<UsnRecordV2>() <= bytes_returned as usize {
+            let record = &*(buffer.as_ptr().add(offset) as *const UsnRecordV2);
+            
+            if record.record_length == 0 {
+                break;
+            }
+            
+            // Extract filename
+            let name_offset = offset + record.file_name_offset as usize;
+            let name_length = record.file_name_length as usize;
+            
+            if name_offset + name_length <= bytes_returned as usize {
+                let name_slice = std::slice::from_raw_parts(
+                    buffer.as_ptr().add(name_offset) as *const u16,
+                    name_length / 2
+                );
+                let filename = String::from_utf16_lossy(name_slice);
+                
+                records.push(UsnRecord {
+                    frn: record.file_reference_number,
+                    parent_frn: record.parent_file_reference_number,
+                    usn: record.usn,
+                    reason: record.reason,
+                    filename,
+                });
+            }
+            
+            offset += record.record_length as usize;
+            
+            // Safety limit
+            if records.len() >= 10000 {
+                break;
+            }
+        }
+        
+        Ok(records)
+    }
 }
 
 #[cfg(not(windows))]
@@ -328,48 +521,55 @@ fn read_usn_deltas(_volume: &str, _start_usn: i64) -> Result<Vec<UsnRecord>> {
     Ok(vec![])
 }
 
-#[derive(Debug)]
-struct UsnRecord {
-    frn: u64,
-    parent_frn: u64,
-    usn: i64,
-    reason: u32,
-    filename: String,
-}
-
 fn process_records(
     records: Vec<UsnRecord>,
     baseline: &mut CachedBaseline,
     scan_root: &str,
 ) -> Result<Vec<FileEvent>> {
     let mut events = Vec::new();
+    let mut seen_frns = std::collections::HashSet::new();
     
     for record in records {
-        let op = classify_reason(record.reason);
-        let path = resolve_path(record.frn, record.parent_frn, baseline, scan_root);
+        // Skip duplicates (same FRN)
+        if !seen_frns.insert(record.frn) {
+            continue;
+        }
         
-        if let Some(path) = path {
-            if path.starts_with(scan_root) {
-                let old_path = if op == "renamed" {
-                    baseline.entries.get(&record.frn).map(|e| e.path.clone())
-                } else {
-                    None
-                };
-                
-                events.push(FileEvent {
-                    op: op.to_string(),
-                    path: path.clone(),
-                    old_path,
-                    frn: record.frn,
-                    usn: record.usn,
-                });
-                
-                baseline.entries.insert(record.frn, BaselineEntry {
-                    path,
-                    parent_frn: record.parent_frn,
-                    exists: op != "deleted",
-                });
-            }
+        let op = classify_reason(record.reason);
+        
+        // Build path from filename
+        let filename = sanitize_filename(&record.filename);
+        let path = if let Some(parent) = baseline.entries.get(&record.parent_frn) {
+            format!("{}/{}", parent.path, filename)
+        } else if record.parent_frn == 5 {
+            // Root directory
+            format!("{}/{}", scan_root, filename)
+        } else {
+            // Unknown parent - use just filename
+            format!("{}/{}", scan_root, filename)
+        };
+        
+        // Only include if within scan root
+        if path.starts_with(scan_root) {
+            let old_path = if op == "renamed" {
+                baseline.entries.get(&record.frn).map(|e| e.path.clone())
+            } else {
+                None
+            };
+            
+            events.push(FileEvent {
+                op: op.to_string(),
+                path: path.clone(),
+                old_path,
+                frn: record.frn,
+                usn: record.usn,
+            });
+            
+            baseline.entries.insert(record.frn, BaselineEntry {
+                path,
+                parent_frn: record.parent_frn,
+                exists: op != "deleted",
+            });
         }
     }
     
@@ -382,54 +582,37 @@ fn classify_reason(reason: u32) -> &'static str {
     const RENAME_OLD: u32 = 0x00001000;
     const RENAME_NEW: u32 = 0x00002000;
     const DATA_OVERWRITE: u32 = 0x00000001;
+    const DATA_EXTEND: u32 = 0x00000002;
+    const DATA_TRUNCATION: u32 = 0x00000004;
     
     if reason & FILE_DELETE != 0 {
         "deleted"
-    } else if reason & (RENAME_OLD | RENAME_NEW) == (RENAME_OLD | RENAME_NEW) {
+    } else if (reason & (RENAME_OLD | RENAME_NEW)) == (RENAME_OLD | RENAME_NEW) {
         "renamed"
+    } else if reason & RENAME_OLD != 0 {
+        "renamed_old"
+    } else if reason & RENAME_NEW != 0 {
+        "renamed_new"
     } else if reason & FILE_CREATE != 0 {
         "created"
-    } else if reason & DATA_OVERWRITE != 0 {
+    } else if reason & (DATA_OVERWRITE | DATA_EXTEND | DATA_TRUNCATION) != 0 {
         "modified"
     } else {
         "modified"
     }
 }
 
-fn resolve_path(
-    frn: u64,
-    parent_frn: u64,
-    baseline: &CachedBaseline,
-    scan_root: &str,
-) -> Option<String> {
-    if let Some(entry) = baseline.entries.get(&frn) {
-        if entry.exists {
-            return Some(entry.path.clone());
-        }
-    }
-    
-    let parent_path = if parent_frn == 5 {
-        scan_root.to_string()
-    } else if let Some(parent) = baseline.entries.get(&parent_frn) {
-        parent.path.clone()
-    } else {
-        return None;
-    };
-    
-    Some(format!("{}/file_{}", parent_path, frn))
+fn sanitize_filename(name: &str) -> String {
+    name.replace(['\0'], "")
 }
 
 fn get_volume_from_path(path: &Path) -> Result<String> {
     let canonical = std::fs::canonicalize(path)?;
     let path_str = canonical.to_string_lossy();
     
-    // Handle extended-length paths: \\?\C:\...
-    // Extract drive letter from the path
     let drive_letter = if path_str.starts_with(r"\\?\") {
-        // Extended path: \\?\C:\...
         path_str.chars().nth(4)
     } else {
-        // Normal path: C:\...
         path_str.chars().next()
     }.ok_or_else(|| anyhow::anyhow!("Invalid path: {}", path_str))?;
     
