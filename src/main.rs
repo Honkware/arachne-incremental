@@ -242,16 +242,24 @@ fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
         &std::fs::read_to_string(&bootstrap_path)?
     )?;
     
+    // Small delay to ensure USN records are flushed
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    
     let start = Instant::now();
     let records = read_usn_deltas(&bootstrap.volume_path, bootstrap.next_usn)?;
     let incremental_time = start.elapsed();
     
+    // Debug: show all records
+    println!("      Debug: All {} USN records:", records.len());
+    for (i, r) in records.iter().take(5).enumerate() {
+        println!("        [{}] {} - reason: 0x{:08x}", i, r.filename, r.reason);
+    }
+    
     // Filter to only include records from our test directory
-    let test_dir_canonical = std::fs::canonicalize(&test_dir)?;
     let relevant_records: Vec<_> = records.iter()
         .filter(|r| {
             // Check if filename matches our test file pattern
-            r.filename.starts_with("file_") && r.filename.ends_with(".txt")
+            r.filename.contains("file_") && r.filename.contains(".txt")
         })
         .collect();
     
