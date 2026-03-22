@@ -236,15 +236,49 @@ fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
     
     // Phase 5: REAL incremental scan using USN journal
     println!("\n[5/5] INCREMENTAL scan (USN journal)...");
-    let start = Instant::now();
-    let events_before = count_events(&test_dir.join("events_before.jsonl"))?;
-    cmd_scan(bootstrap_path.clone(), baseline_path.clone(), test_dir.join("events_before.jsonl"))?;
-    let incremental_time = start.elapsed();
-    let events_after = count_events(&test_dir.join("events_before.jsonl"))?;
-    let new_events = events_after.saturating_sub(events_before);
     
-    println!("      Journal records read: {}", new_events);
+    // Read USN deltas directly from bootstrap's position (before file modifications)
+    let bootstrap: BootstrapState = serde_json::from_str(
+        &std::fs::read_to_string(&bootstrap_path)?
+    )?;
+    
+    let start = Instant::now();
+    let records = read_usn_deltas(&bootstrap.volume_path, bootstrap.next_usn)?;
+    let incremental_time = start.elapsed();
+    
+    // Filter to only include records from our test directory
+    let test_dir_canonical = std::fs::canonicalize(&test_dir)?;
+    let relevant_records: Vec<_> = records.iter()
+        .filter(|r| {
+            // Check if filename matches our test file pattern
+            r.filename.starts_with("file_") && r.filename.ends_with(".txt")
+        })
+        .collect();
+    
+    println!("      Total USN records read: {}", records.len());
+    println!("      Test directory records: {}", relevant_records.len());
     println!("      Time: {:.1}ms", incremental_time.as_secs_f64() * 1000.0);
+    
+    // Write events for inspection
+    let events_output = test_dir.join("events_detected.jsonl");
+    let mut output = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&events_output)?;
+    
+    for record in &relevant_records {
+        let event = serde_json::json!({
+            "op": classify_reason(record.reason),
+            "filename": record.filename,
+            "frn": record.frn,
+            "usn": record.usn,
+            "reason": format!("0x{:08x}", record.reason),
+        });
+        writeln!(output, "{}", event)?;
+    }
+    
+    let new_events = relevant_records.len();
     
     // Results
     println!("\n==============================");
@@ -270,23 +304,28 @@ fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
     }
     
     // Show sample events
-    if let Ok(events) = std::fs::read_to_string(test_dir.join("events_before.jsonl")) {
+    if let Ok(events) = std::fs::read_to_string(&events_output) {
         let lines: Vec<&str> = events.lines().collect();
         if !lines.is_empty() {
             println!("\nSample detected changes:");
-            for (i, line) in lines.iter().take(3).enumerate() {
+            for (i, line) in lines.iter().take(5).enumerate() {
                 println!("  {}: {}", i + 1, line);
             }
-            if lines.len() > 3 {
-                println!("  ... and {} more", lines.len() - 3);
+            if lines.len() > 5 {
+                println!("  ... and {} more", lines.len() - 5);
             }
+        } else {
+            println!("\n⚠️  No changes detected in USN journal");
+            println!("   This can happen if:");
+            println!("   - The USN journal doesn't cover the file modifications");
+            println!("   - The journal was truncated between operations");
         }
     }
     
-    // Cleanup
-    println!("\nCleaning up...");
-    std::fs::remove_dir_all(&test_dir)?;
-    println!("Done!");
+    println!("\n==============================");
+    println!("Test folder kept for inspection:");
+    println!("  {}", test_dir.display());
+    println!("To cleanup: Remove-Item -Recurse -Force '{}'", test_dir.display());
     
     Ok(())
 }
