@@ -14,6 +14,8 @@ serde_json = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 winapi = { version = "0.3", features = ["winnt", "winbase", "fileapi", "handleapi", "ntdef", "ioapiset", "errhandlingapi"] }
 ntapi = "0.4"
+chrono = { version = "0.4", features = ["clock"] }
+glob = "0.3"
 
 [profile.release]
 opt-level = 3

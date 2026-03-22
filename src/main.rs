@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Fast incremental NTFS change detection
 #[derive(Parser)]
@@ -38,6 +38,39 @@ enum Commands {
         /// Output file for events (JSONL format)
         #[arg(short, long)]
         output: PathBuf,
+        /// Include only these operations (comma-separated: created,modified,renamed,deleted)
+        #[arg(short, long, value_delimiter = ',')]
+        ops: Option<Vec<String>>,
+        /// Include only paths matching these patterns (comma-separated globs)
+        #[arg(short, long, value_delimiter = ',')]
+        include: Option<Vec<String>>,
+        /// Exclude paths matching these patterns (comma-separated globs)
+        #[arg(short, long, value_delimiter = ',')]
+        exclude: Option<Vec<String>>,
+        /// Output summary only (no individual events)
+        #[arg(long)]
+        summary: bool,
+    },
+    /// Watch for changes continuously
+    Watch {
+        /// Bootstrap state file
+        #[arg(short, long)]
+        bootstrap: PathBuf,
+        /// Baseline cache file
+        #[arg(short, long)]
+        baseline: PathBuf,
+        /// Poll interval in seconds
+        #[arg(short, long, default_value = "5")]
+        interval: u64,
+        /// Include only these operations
+        #[arg(short, long, value_delimiter = ',')]
+        ops: Option<Vec<String>>,
+        /// Exclude paths matching these patterns
+        #[arg(short, long, value_delimiter = ',')]
+        exclude: Option<Vec<String>>,
+        /// Output format (jsonl, log)
+        #[arg(long, default_value = "log")]
+        format: String,
     },
     /// Benchmark full scan vs incremental
     Benchmark {
@@ -75,7 +108,7 @@ struct CachedBaseline {
 }
 
 /// File change event
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct FileEvent {
     op: String,
     path: String,
@@ -83,6 +116,20 @@ struct FileEvent {
     old_path: Option<String>,
     frn: u64,
     usn: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<String>,
+}
+
+/// Scan summary statistics
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct ScanSummary {
+    total_events: usize,
+    created: usize,
+    modified: usize,
+    renamed: usize,
+    deleted: usize,
+    scan_time_ms: u64,
+    files_per_second: f64,
 }
 
 /// USN Record from journal
@@ -95,108 +142,325 @@ struct UsnRecord {
     filename: String,
 }
 
+/// Event filter configuration
+struct EventFilter {
+    ops: Option<Vec<String>>,
+    include_patterns: Option<Vec<glob::Pattern>>,
+    exclude_patterns: Option<Vec<glob::Pattern>>,
+}
+
+impl EventFilter {
+    fn new(
+        ops: Option<Vec<String>>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> Result<Self> {
+        let include_patterns = include.map(|patterns| {
+            patterns
+                .into_iter()
+                .filter_map(|p| glob::Pattern::new(&p).ok())
+                .collect()
+        });
+
+        let exclude_patterns = exclude.map(|patterns| {
+            patterns
+                .into_iter()
+                .filter_map(|p| glob::Pattern::new(&p).ok())
+                .collect()
+        });
+
+        Ok(Self {
+            ops,
+            include_patterns,
+            exclude_patterns,
+        })
+    }
+
+    fn matches(&self, event: &FileEvent) -> bool {
+        // Check operation filter
+        if let Some(ref ops) = self.ops {
+            if !ops.iter().any(|op| op.eq_ignore_ascii_case(&event.op)) {
+                return false;
+            }
+        }
+
+        // Check exclude patterns
+        if let Some(ref excludes) = self.exclude_patterns {
+            for pattern in excludes {
+                if pattern.matches(&event.path) || pattern.matches(&event.filename()) {
+                    return false;
+                }
+            }
+        }
+
+        // Check include patterns
+        if let Some(ref includes) = self.include_patterns {
+            let matches_include = includes.iter().any(|pattern| {
+                pattern.matches(&event.path) || pattern.matches(&event.filename())
+            });
+            if !matches_include {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl FileEvent {
+    fn filename(&self) -> String {
+        Path::new(&self.path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Bootstrap { path, output } => cmd_bootstrap(path, output),
-        Commands::Scan { bootstrap, baseline, output } => cmd_scan(bootstrap, baseline, output),
+        Commands::Scan {
+            bootstrap,
+            baseline,
+            output,
+            ops,
+            include,
+            exclude,
+            summary,
+        } => cmd_scan(bootstrap, baseline, output, ops, include, exclude, summary),
+        Commands::Watch {
+            bootstrap,
+            baseline,
+            interval,
+            ops,
+            exclude,
+            format,
+        } => cmd_watch(bootstrap, baseline, interval, ops, exclude, format),
         Commands::Benchmark { path, count } => cmd_benchmark(path, count),
     }
+}
+
+fn now_iso() -> String {
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%z").to_string()
 }
 
 /// Create bootstrap state by querying USN journal
 fn cmd_bootstrap(path: PathBuf, output: PathBuf) -> Result<()> {
     let abs_path = std::fs::canonicalize(&path)
         .with_context(|| format!("Cannot access path: {}", path.display()))?;
-    
+
     let volume = get_volume_from_path(&abs_path)?;
-    
+
     println!("Creating bootstrap for: {}", abs_path.display());
     println!("Volume: {}", volume);
-    
+
     let (journal_id, next_usn) = query_usn_journal(&volume)?;
-    
+
     let bootstrap = BootstrapState {
         journal_id,
         next_usn,
         volume_path: volume,
         scan_root: abs_path.to_string_lossy().to_string(),
     };
-    
+
     let json = serde_json::to_string_pretty(&bootstrap)?;
     std::fs::write(&output, json)
         .with_context(|| format!("Failed to write {}", output.display()))?;
-    
+
     println!("Bootstrap created: {}", output.display());
     println!("  Journal ID: {:#018x}", bootstrap.journal_id);
     println!("  Next USN: {}", bootstrap.next_usn);
-    
+
     Ok(())
 }
 
 /// Run incremental scan
-fn cmd_scan(bootstrap_path: PathBuf, baseline_path: PathBuf, output_path: PathBuf) -> Result<()> {
+fn cmd_scan(
+    bootstrap_path: PathBuf,
+    baseline_path: PathBuf,
+    output_path: PathBuf,
+    ops_filter: Option<Vec<String>>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    summary_only: bool,
+) -> Result<()> {
+    let start = Instant::now();
+
     let bootstrap: BootstrapState = serde_json::from_str(
-        &std::fs::read_to_string(&bootstrap_path)?
-    ).with_context(|| "Invalid bootstrap file")?;
-    
-    println!("Scanning: {}", bootstrap.scan_root);
-    println!("Baseline: {}", baseline_path.display());
-    
+        &std::fs::read_to_string(&bootstrap_path)?,
+    )
+    .with_context(|| "Invalid bootstrap file")?;
+
+    let filter = EventFilter::new(ops_filter, include, exclude)?;
+
     let mut baseline: CachedBaseline = if baseline_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&baseline_path)?)
-            .unwrap_or_default()
+        serde_json::from_str(&std::fs::read_to_string(&baseline_path)?).unwrap_or_default()
     } else {
-        println!("Creating new baseline cache...");
         CachedBaseline::default()
     };
-    
-    let start = Instant::now();
+
     let records = read_usn_deltas(&bootstrap.volume_path, baseline.last_usn)?;
     let read_time = start.elapsed();
-    
-    println!("Read {} USN records in {:.1}ms", records.len(), read_time.as_secs_f64() * 1000.0);
-    
+
     let events = process_records(records, &mut baseline, &bootstrap.scan_root)?;
-    
-    println!("Generated {} events", events.len());
-    
-    let mut output = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&output_path)?;
-    
-    for event in &events {
-        writeln!(output, "{}", serde_json::to_string(event)?)?;
+
+    // Filter events
+    let filtered_events: Vec<FileEvent> = events
+        .into_iter()
+        .filter(|e| filter.matches(e))
+        .map(|mut e| {
+            e.timestamp = Some(now_iso());
+            e
+        })
+        .collect();
+
+    let scan_time_ms = read_time.as_millis() as u64;
+
+    if summary_only {
+        let summary = create_summary(&filtered_events, scan_time_ms);
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        let mut output = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&output_path)?;
+
+        for event in &filtered_events {
+            writeln!(output, "{}", serde_json::to_string(event)?)?;
+        }
+
+        println!("Detected {} changes in {}ms", filtered_events.len(), scan_time_ms);
+        println!("Output: {}", output_path.display());
     }
-    
-    if let Some(last) = events.last() {
+
+    if let Some(last) = filtered_events.last() {
         baseline.last_usn = last.usn;
     }
-    
+
     std::fs::write(&baseline_path, serde_json::to_string_pretty(&baseline)?)?;
-    
-    println!("Output written to: {}", output_path.display());
-    
+
     Ok(())
+}
+
+/// Watch mode - continuous monitoring
+fn cmd_watch(
+    bootstrap_path: PathBuf,
+    baseline_path: PathBuf,
+    interval_secs: u64,
+    ops_filter: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    format: String,
+) -> Result<()> {
+    let bootstrap: BootstrapState = serde_json::from_str(
+        &std::fs::read_to_string(&bootstrap_path)?,
+    )
+    .with_context(|| "Invalid bootstrap file")?;
+
+    let filter = EventFilter::new(ops_filter, None, exclude)?;
+
+    let mut baseline: CachedBaseline = if baseline_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&baseline_path)?).unwrap_or_default()
+    } else {
+        CachedBaseline::default()
+    };
+
+    println!("Watching: {}", bootstrap.scan_root);
+    println!("Poll interval: {}s", interval_secs);
+    println!("Press Ctrl+C to stop\n");
+
+    let interval = Duration::from_secs(interval_secs);
+
+    loop {
+        let start = Instant::now();
+
+        match read_usn_deltas(&bootstrap.volume_path, baseline.last_usn) {
+            Ok(records) => {
+                let events = process_records(records, &mut baseline, &bootstrap.scan_root)?;
+
+                let filtered_events: Vec<FileEvent> = events
+                    .into_iter()
+                    .filter(|e| filter.matches(e))
+                    .map(|mut e| {
+                        e.timestamp = Some(now_iso());
+                        e
+                    })
+                    .collect();
+
+                if !filtered_events.is_empty() {
+                    for event in &filtered_events {
+                        match format.as_str() {
+                            "jsonl" => println!("{}", serde_json::to_string(event)?),
+                            _ => println!(
+                                "[{}] {}: {}",
+                                event.timestamp.as_ref().unwrap_or(&"?".to_string()),
+                                event.op.to_uppercase(),
+                                event.path
+                            ),
+                        }
+                    }
+
+                    if let Some(last) = filtered_events.last() {
+                        baseline.last_usn = last.usn;
+                        let _ = std::fs::write(
+                            &baseline_path,
+                            serde_json::to_string_pretty(&baseline)?,
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[ERROR] Failed to read USN journal: {}", e);
+            }
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed < interval {
+            std::thread::sleep(interval - elapsed);
+        }
+    }
+}
+
+fn create_summary(events: &[FileEvent], scan_time_ms: u64) -> ScanSummary {
+    let mut summary = ScanSummary {
+        total_events: events.len(),
+        scan_time_ms,
+        ..Default::default()
+    };
+
+    for event in events {
+        match event.op.as_str() {
+            "created" => summary.created += 1,
+            "modified" => summary.modified += 1,
+            "renamed" => summary.renamed += 1,
+            "deleted" => summary.deleted += 1,
+            _ => {}
+        }
+    }
+
+    summary.files_per_second = if scan_time_ms > 0 {
+        (events.len() as f64 / scan_time_ms as f64) * 1000.0
+    } else {
+        0.0
+    };
+
+    summary
 }
 
 /// Benchmark full scan vs incremental
 fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
     let test_dir = path.join("benchmark_test");
-    
+
     println!("Arachne Incremental Benchmark");
     println!("==============================");
     println!("Test files: {}", count);
     println!();
-    
-    // Cleanup previous test
+
     let _ = std::fs::remove_dir_all(&test_dir);
     std::fs::create_dir_all(&test_dir)?;
-    
-    // Phase 1: Create test files
+
     println!("[1/5] Creating {} test files...", count);
     let start = Instant::now();
     for i in 0..count {
@@ -205,8 +469,7 @@ fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
     }
     let create_time = start.elapsed();
     println!("      Created in {:.2}s", create_time.as_secs_f64());
-    
-    // Phase 2: Full directory walk
+
     println!("\n[2/5] FULL scan (directory walk)...");
     let start = Instant::now();
     let mut full_scan_count = 0;
@@ -214,18 +477,23 @@ fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
     let full_scan_time = start.elapsed();
     println!("      Files scanned: {}", full_scan_count);
     println!("      Time: {:.2}s", full_scan_time.as_secs_f64());
-    
-    // Phase 3: Create bootstrap and baseline
+
     println!("\n[3/5] Creating bootstrap (USN journal cursor)...");
     let bootstrap_path = test_dir.join("bootstrap.json");
     cmd_bootstrap(test_dir.clone(), bootstrap_path.clone())?;
-    
-    // Create baseline by doing a full scan
+
     println!("      Creating baseline cache...");
     let baseline_path = test_dir.join("baseline.json");
-    cmd_scan(bootstrap_path.clone(), baseline_path.clone(), test_dir.join("events_init.jsonl"))?;
-    
-    // Phase 4: Modify files (1% churn)
+    cmd_scan(
+        bootstrap_path.clone(),
+        baseline_path.clone(),
+        test_dir.join("events_init.jsonl"),
+        None,
+        None,
+        None,
+        false,
+    )?;
+
     let modify_count = count.max(100) / 100;
     println!("\n[4/5] Modifying {} files (1% churn)...", modify_count);
     for i in 0..modify_count {
@@ -233,48 +501,42 @@ fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
         std::fs::write(&file_path, format!("modified content {}", i))?;
     }
     println!("      Done");
-    
-    // Phase 5: REAL incremental scan using USN journal
+
     println!("\n[5/5] INCREMENTAL scan (USN journal)...");
-    
-    // Read USN deltas directly from bootstrap's position (before file modifications)
-    let bootstrap: BootstrapState = serde_json::from_str(
-        &std::fs::read_to_string(&bootstrap_path)?
-    )?;
-    
-    // Small delay to ensure USN records are flushed
+
+    let bootstrap: BootstrapState =
+        serde_json::from_str(&std::fs::read_to_string(&bootstrap_path)?)?;
+
     std::thread::sleep(std::time::Duration::from_millis(100));
-    
+
     let start = Instant::now();
     let records = read_usn_deltas(&bootstrap.volume_path, bootstrap.next_usn)?;
     let incremental_time = start.elapsed();
-    
-    // Debug: show all records
+
     println!("      Debug: All {} USN records:", records.len());
     for (i, r) in records.iter().take(5).enumerate() {
         println!("        [{}] {} - reason: 0x{:08x}", i, r.filename, r.reason);
     }
-    
-    // Filter to only include records from our test directory
-    let relevant_records: Vec<_> = records.iter()
-        .filter(|r| {
-            // Check if filename matches our test file pattern
-            r.filename.contains("file_") && r.filename.contains(".txt")
-        })
+
+    let relevant_records: Vec<_> = records
+        .iter()
+        .filter(|r| r.filename.contains("file_") && r.filename.contains(".txt"))
         .collect();
-    
+
     println!("      Total USN records read: {}", records.len());
     println!("      Test directory records: {}", relevant_records.len());
-    println!("      Time: {:.1}ms", incremental_time.as_secs_f64() * 1000.0);
-    
-    // Write events for inspection
+    println!(
+        "      Time: {:.1}ms",
+        incremental_time.as_secs_f64() * 1000.0
+    );
+
     let events_output = test_dir.join("events_detected.jsonl");
     let mut output = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&events_output)?;
-    
+
     for record in &relevant_records {
         let event = serde_json::json!({
             "op": classify_reason(record.reason),
@@ -285,33 +547,39 @@ fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
         });
         writeln!(output, "{}", event)?;
     }
-    
+
     let new_events = relevant_records.len();
-    
-    // Results
+
     println!("\n==============================");
     println!("RESULTS");
     println!("==============================");
     println!();
-    println!("Full Directory Walk:  {:.2}s (scanned {} files)", full_scan_time.as_secs_f64(), full_scan_count);
-    println!("USN Journal Scan:     {:.1}ms (read {} deltas)", incremental_time.as_secs_f64() * 1000.0, new_events);
-    
+    println!(
+        "Full Directory Walk:  {:.2}s (scanned {} files)",
+        full_scan_time.as_secs_f64(),
+        full_scan_count
+    );
+    println!(
+        "USN Journal Scan:     {:.1}ms (read {} deltas)",
+        incremental_time.as_secs_f64() * 1000.0,
+        new_events
+    );
+
     let reduction = if full_scan_time.as_secs_f64() > 0.0 {
         (1.0 - (incremental_time.as_secs_f64() / full_scan_time.as_secs_f64())) * 100.0
     } else {
         0.0
     };
-    
+
     println!("Performance Gain:     {:.1}% faster", reduction);
     println!();
-    
+
     if reduction >= 80.0 {
         println!("✅ PASS: >= 80% latency reduction achieved!");
     } else {
         println!("⚠️  Result: {:.1}% reduction", reduction);
     }
-    
-    // Show sample events
+
     if let Ok(events) = std::fs::read_to_string(&events_output) {
         let lines: Vec<&str> = events.lines().collect();
         if !lines.is_empty() {
@@ -329,12 +597,15 @@ fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
             println!("   - The journal was truncated between operations");
         }
     }
-    
+
     println!("\n==============================");
     println!("Test folder kept for inspection:");
     println!("  {}", test_dir.display());
-    println!("To cleanup: Remove-Item -Recurse -Force '{}'", test_dir.display());
-    
+    println!(
+        "To cleanup: Remove-Item -Recurse -Force '{}'",
+        test_dir.display()
+    );
+
     Ok(())
 }
 
@@ -350,14 +621,6 @@ fn walk_directory(dir: &Path, count: &mut usize) -> Result<()> {
     Ok(())
 }
 
-fn count_events(path: &Path) -> Result<usize> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let content = std::fs::read_to_string(path)?;
-    Ok(content.lines().count())
-}
-
 #[cfg(windows)]
 fn query_usn_journal(volume: &str) -> Result<(u64, i64)> {
     use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
@@ -365,9 +628,9 @@ fn query_usn_journal(volume: &str) -> Result<(u64, i64)> {
     use winapi::um::ioapiset::DeviceIoControl;
     use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
     use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ};
-    
+
     const FSCTL_QUERY_USN_JOURNAL: u32 = 0x000900f4;
-    
+
     #[repr(C)]
     struct UsnJournalData {
         usn_journal_id: u64,
@@ -378,12 +641,12 @@ fn query_usn_journal(volume: &str) -> Result<(u64, i64)> {
         maximum_size: u64,
         allocation_delta: u64,
     }
-    
+
     let volume_path: Vec<u16> = format!("\\\\.\\{}:", volume.trim_end_matches(':'))
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    
+
     unsafe {
         let handle = CreateFileW(
             volume_path.as_ptr(),
@@ -394,14 +657,14 @@ fn query_usn_journal(volume: &str) -> Result<(u64, i64)> {
             FILE_FLAG_BACKUP_SEMANTICS,
             std::ptr::null_mut(),
         );
-        
+
         if handle == INVALID_HANDLE_VALUE {
-            return Err(anyhow::anyhow!("Failed to open volume {} - requires Administrator", volume));
+            return Err(anyhow::anyhow!("Failed to open volume {}", volume));
         }
-        
+
         let mut journal_data: UsnJournalData = std::mem::zeroed();
         let mut bytes_returned: u32 = 0;
-        
+
         let result = DeviceIoControl(
             handle,
             FSCTL_QUERY_USN_JOURNAL,
@@ -412,13 +675,16 @@ fn query_usn_journal(volume: &str) -> Result<(u64, i64)> {
             &mut bytes_returned,
             std::ptr::null_mut(),
         );
-        
+
         winapi::um::handleapi::CloseHandle(handle);
-        
+
         if result == 0 {
-            return Err(anyhow::anyhow!("USN journal query failed - journal may not exist. Run: fsutil usn createjournal {}:", volume));
+            return Err(anyhow::anyhow!(
+                "USN journal query failed - journal may not exist. Run: fsutil usn createjournal {}:",
+                volume
+            ));
         }
-        
+
         Ok((journal_data.usn_journal_id, journal_data.next_usn))
     }
 }
@@ -430,10 +696,10 @@ fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
     use winapi::um::ioapiset::DeviceIoControl;
     use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
     use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ};
-    
+
     const FSCTL_READ_USN_JOURNAL: u32 = 0x000900bb;
     const MAX_USN_RECORD_SIZE: usize = 65536;
-    
+
     #[repr(C)]
     struct ReadUsnJournalData {
         start_usn: i64,
@@ -443,7 +709,7 @@ fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
         bytes_to_wait_for: u64,
         usn_journal_id: u64,
     }
-    
+
     #[repr(C, packed)]
     struct UsnRecordV2 {
         record_length: u32,
@@ -460,12 +726,12 @@ fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
         file_name_length: u16,
         file_name_offset: u16,
     }
-    
+
     let volume_path: Vec<u16> = format!("\\\\.\\{}:", volume.trim_end_matches(':'))
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    
+
     unsafe {
         let handle = CreateFileW(
             volume_path.as_ptr(),
@@ -476,26 +742,25 @@ fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
             FILE_FLAG_BACKUP_SEMANTICS,
             std::ptr::null_mut(),
         );
-        
+
         if handle == INVALID_HANDLE_VALUE {
             return Err(anyhow::anyhow!("Failed to open volume {}", volume));
         }
-        
-        // Get journal ID first
+
         let (journal_id, _) = query_usn_journal(volume)?;
-        
+
         let read_data = ReadUsnJournalData {
             start_usn,
-            reason_mask: 0xFFFFFFFF, // All reasons
+            reason_mask: 0xFFFFFFFF,
             return_only_on_close: 0,
             timeout: 0,
             bytes_to_wait_for: 0,
             usn_journal_id: journal_id,
         };
-        
+
         let mut buffer: Vec<u8> = vec![0; MAX_USN_RECORD_SIZE];
         let mut bytes_returned: u32 = 0;
-        
+
         let result = DeviceIoControl(
             handle,
             FSCTL_READ_USN_JOURNAL,
@@ -506,42 +771,37 @@ fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
             &mut bytes_returned,
             std::ptr::null_mut(),
         );
-        
+
         winapi::um::handleapi::CloseHandle(handle);
-        
+
         if result == 0 {
-            // No new records is OK
             return Ok(vec![]);
         }
-        
-        // Parse USN records from buffer
-        // Buffer format: [next_usn: 8 bytes] [record1] [record2] ...
+
         let mut records = Vec::new();
-        let mut offset = std::mem::size_of::<i64>(); // Skip the next_usn at start of buffer
-        
+        let mut offset = std::mem::size_of::<i64>();
+
         while offset + std::mem::size_of::<UsnRecordV2>() <= bytes_returned as usize {
             let record = &*(buffer.as_ptr().add(offset) as *const UsnRecordV2);
-            
+
             if record.record_length == 0 {
                 break;
             }
-            
-            // Check if we have enough data for this record
+
             if offset + record.record_length as usize > bytes_returned as usize {
                 break;
             }
-            
-            // Extract filename - file_name_offset is relative to record start
+
             let name_offset = offset + record.file_name_offset as usize;
             let name_length = record.file_name_length as usize;
-            
+
             if name_offset + name_length <= bytes_returned as usize && name_length > 0 {
                 let name_slice = std::slice::from_raw_parts(
                     buffer.as_ptr().add(name_offset) as *const u16,
-                    name_length / 2
+                    name_length / 2,
                 );
                 let filename = String::from_utf16_lossy(name_slice);
-                
+
                 records.push(UsnRecord {
                     frn: record.file_reference_number,
                     parent_frn: record.parent_file_reference_number,
@@ -550,16 +810,15 @@ fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
                     filename,
                 });
             }
-            
+
             offset += record.record_length as usize;
-            offset = (offset + 7) & !7; // Align to 8-byte boundary
-            
-            // Safety limit
+            offset = (offset + 7) & !7;
+
             if records.len() >= 10000 {
                 break;
             }
         }
-        
+
         Ok(records)
     }
 }
@@ -582,51 +841,49 @@ fn process_records(
 ) -> Result<Vec<FileEvent>> {
     let mut events = Vec::new();
     let mut seen_frns = std::collections::HashSet::new();
-    
+
     for record in records {
-        // Skip duplicates (same FRN)
         if !seen_frns.insert(record.frn) {
             continue;
         }
-        
+
         let op = classify_reason(record.reason);
-        
-        // Build path from filename
         let filename = sanitize_filename(&record.filename);
         let path = if let Some(parent) = baseline.entries.get(&record.parent_frn) {
             format!("{}/{}", parent.path, filename)
         } else if record.parent_frn == 5 {
-            // Root directory
             format!("{}/{}", scan_root, filename)
         } else {
-            // Unknown parent - use just filename
             format!("{}/{}", scan_root, filename)
         };
-        
-        // Only include if within scan root
+
         if path.starts_with(scan_root) {
             let old_path = if op == "renamed" {
                 baseline.entries.get(&record.frn).map(|e| e.path.clone())
             } else {
                 None
             };
-            
+
             events.push(FileEvent {
                 op: op.to_string(),
                 path: path.clone(),
                 old_path,
                 frn: record.frn,
                 usn: record.usn,
+                timestamp: None,
             });
-            
-            baseline.entries.insert(record.frn, BaselineEntry {
-                path,
-                parent_frn: record.parent_frn,
-                exists: op != "deleted",
-            });
+
+            baseline.entries.insert(
+                record.frn,
+                BaselineEntry {
+                    path,
+                    parent_frn: record.parent_frn,
+                    exists: op != "deleted",
+                },
+            );
         }
     }
-    
+
     Ok(events)
 }
 
@@ -638,7 +895,7 @@ fn classify_reason(reason: u32) -> &'static str {
     const DATA_OVERWRITE: u32 = 0x00000001;
     const DATA_EXTEND: u32 = 0x00000002;
     const DATA_TRUNCATION: u32 = 0x00000004;
-    
+
     if reason & FILE_DELETE != 0 {
         "deleted"
     } else if (reason & (RENAME_OLD | RENAME_NEW)) == (RENAME_OLD | RENAME_NEW) {
@@ -663,12 +920,13 @@ fn sanitize_filename(name: &str) -> String {
 fn get_volume_from_path(path: &Path) -> Result<String> {
     let canonical = std::fs::canonicalize(path)?;
     let path_str = canonical.to_string_lossy();
-    
+
     let drive_letter = if path_str.starts_with(r"\\?\") {
         path_str.chars().nth(4)
     } else {
         path_str.chars().next()
-    }.ok_or_else(|| anyhow::anyhow!("Invalid path: {}", path_str))?;
-    
+    }
+    .ok_or_else(|| anyhow::anyhow!("Invalid path: {}", path_str))?;
+
     Ok(drive_letter.to_uppercase().to_string())
 }
