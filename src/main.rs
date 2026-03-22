@@ -421,8 +421,17 @@ fn resolve_path(
 
 fn get_volume_from_path(path: &Path) -> Result<String> {
     let canonical = std::fs::canonicalize(path)?;
-    let drive = canonical.to_string_lossy();
-    let drive_letter = drive.chars().next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid path"))?;
-    Ok(format!("{}", drive_letter).to_uppercase())
+    let path_str = canonical.to_string_lossy();
+    
+    // Handle extended-length paths: \\?\C:\...
+    // Extract drive letter from the path
+    let drive_letter = if path_str.starts_with(r"\\?\") {
+        // Extended path: \\?\C:\...
+        path_str.chars().nth(4)
+    } else {
+        // Normal path: C:\...
+        path_str.chars().next()
+    }.ok_or_else(|| anyhow::anyhow!("Invalid path: {}", path_str))?;
+    
+    Ok(drive_letter.to_uppercase().to_string())
 }
