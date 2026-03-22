@@ -431,7 +431,7 @@ fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
         );
         
         if handle == INVALID_HANDLE_VALUE {
-            return Err(anyhow::anyhow!("Failed to open volume {}"));
+            return Err(anyhow::anyhow!("Failed to open volume {}", volume));
         }
         
         // Get journal ID first
