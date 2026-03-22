@@ -515,8 +515,9 @@ fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
         }
         
         // Parse USN records from buffer
+        // Buffer format: [next_usn: 8 bytes] [record1] [record2] ...
         let mut records = Vec::new();
-        let mut offset = 0;
+        let mut offset = std::mem::size_of::<i64>(); // Skip the next_usn at start of buffer
         
         while offset + std::mem::size_of::<UsnRecordV2>() <= bytes_returned as usize {
             let record = &*(buffer.as_ptr().add(offset) as *const UsnRecordV2);
@@ -525,11 +526,16 @@ fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
                 break;
             }
             
-            // Extract filename
+            // Check if we have enough data for this record
+            if offset + record.record_length as usize > bytes_returned as usize {
+                break;
+            }
+            
+            // Extract filename - file_name_offset is relative to record start
             let name_offset = offset + record.file_name_offset as usize;
             let name_length = record.file_name_length as usize;
             
-            if name_offset + name_length <= bytes_returned as usize {
+            if name_offset + name_length <= bytes_returned as usize && name_length > 0 {
                 let name_slice = std::slice::from_raw_parts(
                     buffer.as_ptr().add(name_offset) as *const u16,
                     name_length / 2
@@ -546,6 +552,7 @@ fn read_usn_deltas(volume: &str, start_usn: i64) -> Result<Vec<UsnRecord>> {
             }
             
             offset += record.record_length as usize;
+            offset = (offset + 7) & !7; // Align to 8-byte boundary
             
             // Safety limit
             if records.len() >= 10000 {
