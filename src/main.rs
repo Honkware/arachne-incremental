@@ -208,9 +208,9 @@ impl EventFilter {
 
         // Check include patterns
         if let Some(ref includes) = self.include_patterns {
-            let matches_include = includes.iter().any(|pattern| {
-                pattern.matches(&event.path) || pattern.matches(&event.filename())
-            });
+            let matches_include = includes
+                .iter()
+                .any(|pattern| pattern.matches(&event.path) || pattern.matches(&event.filename()));
             if !matches_include {
                 return false;
             }
@@ -257,7 +257,9 @@ fn main() -> Result<()> {
 }
 
 fn now_iso() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%z").to_string()
+    chrono::Local::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3f%z")
+        .to_string()
 }
 
 /// Create bootstrap state by querying USN journal
@@ -302,11 +304,11 @@ fn cmd_scan(
 ) -> Result<()> {
     let start = Instant::now();
 
-    let bootstrap: BootstrapState = serde_json::from_str(
-        &std::fs::read_to_string(&bootstrap_path)
-            .with_context(|| format!("Cannot read bootstrap file: {}", bootstrap_path.display()))?,
-    )
-    .with_context(|| format!("Invalid bootstrap file: {}", bootstrap_path.display()))?;
+    let bootstrap: BootstrapState =
+        serde_json::from_str(&std::fs::read_to_string(&bootstrap_path).with_context(|| {
+            format!("Cannot read bootstrap file: {}", bootstrap_path.display())
+        })?)
+        .with_context(|| format!("Invalid bootstrap file: {}", bootstrap_path.display()))?;
 
     let filter = EventFilter::new(ops_filter, include, exclude)?;
 
@@ -333,8 +335,11 @@ fn cmd_scan(
         ));
     }
 
-    let (records, last_next_usn) =
-        read_usn_deltas(&bootstrap.volume_path, baseline.last_usn, bootstrap.journal_id)?;
+    let (records, last_next_usn) = read_usn_deltas(
+        &bootstrap.volume_path,
+        baseline.last_usn,
+        bootstrap.journal_id,
+    )?;
     let read_time = start.elapsed();
 
     let events = process_records(records, &mut baseline, &bootstrap.scan_root)?;
@@ -365,7 +370,11 @@ fn cmd_scan(
             writeln!(output, "{}", serde_json::to_string(event)?)?;
         }
 
-        println!("Detected {} changes in {}ms", filtered_events.len(), scan_time_ms);
+        println!(
+            "Detected {} changes in {}ms",
+            filtered_events.len(),
+            scan_time_ms
+        );
         println!("Output: {}", output_path.display());
     }
 
@@ -388,11 +397,11 @@ fn cmd_watch(
     exclude: Option<Vec<String>>,
     format: String,
 ) -> Result<()> {
-    let bootstrap: BootstrapState = serde_json::from_str(
-        &std::fs::read_to_string(&bootstrap_path)
-            .with_context(|| format!("Cannot read bootstrap file: {}", bootstrap_path.display()))?,
-    )
-    .with_context(|| format!("Invalid bootstrap file: {}", bootstrap_path.display()))?;
+    let bootstrap: BootstrapState =
+        serde_json::from_str(&std::fs::read_to_string(&bootstrap_path).with_context(|| {
+            format!("Cannot read bootstrap file: {}", bootstrap_path.display())
+        })?)
+        .with_context(|| format!("Invalid bootstrap file: {}", bootstrap_path.display()))?;
 
     let filter = EventFilter::new(ops_filter, include, exclude)?;
 
@@ -428,7 +437,11 @@ fn cmd_watch(
     loop {
         let start = Instant::now();
 
-        match read_usn_deltas(&bootstrap.volume_path, baseline.last_usn, bootstrap.journal_id) {
+        match read_usn_deltas(
+            &bootstrap.volume_path,
+            baseline.last_usn,
+            bootstrap.journal_id,
+        ) {
             Ok((records, last_next_usn)) => {
                 let events = process_records(records, &mut baseline, &bootstrap.scan_root)?;
 
@@ -457,10 +470,7 @@ fn cmd_watch(
 
                 // Always advance the cursor to the last USN read from the journal.
                 baseline.last_usn = last_next_usn;
-                let _ = std::fs::write(
-                    &baseline_path,
-                    serde_json::to_string_pretty(&baseline)?,
-                );
+                let _ = std::fs::write(&baseline_path, serde_json::to_string_pretty(&baseline)?);
             }
             Err(e) => {
                 eprintln!("[ERROR] Failed to read USN journal: {}", e);
@@ -561,8 +571,11 @@ fn cmd_benchmark(path: PathBuf, count: usize) -> Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let start = Instant::now();
-    let (records, _) =
-        read_usn_deltas(&bootstrap.volume_path, bootstrap.next_usn, bootstrap.journal_id)?;
+    let (records, _) = read_usn_deltas(
+        &bootstrap.volume_path,
+        bootstrap.next_usn,
+        bootstrap.journal_id,
+    )?;
     let incremental_time = start.elapsed();
 
     let relevant_records: Vec<_> = records
@@ -737,11 +750,7 @@ fn query_usn_journal(volume: &str) -> Result<(u64, i64)> {
 }
 
 #[cfg(windows)]
-fn read_usn_deltas(
-    volume: &str,
-    start_usn: i64,
-    journal_id: u64,
-) -> Result<(Vec<UsnRecord>, i64)> {
+fn read_usn_deltas(volume: &str, start_usn: i64, journal_id: u64) -> Result<(Vec<UsnRecord>, i64)> {
     use winapi::um::errhandlingapi::GetLastError;
     use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
     use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -755,7 +764,7 @@ fn read_usn_deltas(
     const ERROR_HANDLE_EOF: u32 = 38;
     const ERROR_JOURNAL_ENTRY_DELETED: u32 = 1181; // 0x49D
     const ERROR_JOURNAL_NOT_ACTIVE: u32 = 1179; // 0x49B
-    // Buffer large enough for many records per call (512 KB).
+                                                // Buffer large enough for many records per call (512 KB).
     const BUFFER_SIZE: usize = 512 * 1024;
 
     #[repr(C)]
@@ -898,8 +907,7 @@ fn read_usn_deltas(
         while offset + std::mem::size_of::<UsnRecordV2>() <= bytes_returned as usize {
             // Safety: `offset` is within `bytes_returned` bytes of a valid Vec<u8>.
             // We use `read_unaligned` for every field because the struct is packed.
-            let record_ptr =
-                unsafe { buffer.as_ptr().add(offset) as *const UsnRecordV2 };
+            let record_ptr = unsafe { buffer.as_ptr().add(offset) as *const UsnRecordV2 };
 
             let record_length = unsafe {
                 std::ptr::read_unaligned(std::ptr::addr_of!((*record_ptr).record_length))
@@ -922,8 +930,7 @@ fn read_usn_deltas(
             // `file_name_offset` is relative to the start of the record, not the buffer.
             let name_buf_offset = offset + file_name_offset;
 
-            if file_name_length > 0
-                && name_buf_offset + file_name_length <= bytes_returned as usize
+            if file_name_length > 0 && name_buf_offset + file_name_length <= bytes_returned as usize
             {
                 let frn = unsafe {
                     std::ptr::read_unaligned(std::ptr::addr_of!(
@@ -935,12 +942,10 @@ fn read_usn_deltas(
                         (*record_ptr).parent_file_reference_number
                     ))
                 };
-                let usn = unsafe {
-                    std::ptr::read_unaligned(std::ptr::addr_of!((*record_ptr).usn))
-                };
-                let reason = unsafe {
-                    std::ptr::read_unaligned(std::ptr::addr_of!((*record_ptr).reason))
-                };
+                let usn =
+                    unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*record_ptr).usn)) };
+                let reason =
+                    unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*record_ptr).reason)) };
 
                 // Safety: `name_buf_offset` and `file_name_length` are within the buffer.
                 let name_slice = unsafe {
@@ -1042,9 +1047,6 @@ fn classify_reason(reason: u32) -> &'static str {
     const FILE_DELETE: u32 = 0x00000200;
     const RENAME_OLD: u32 = 0x00001000;
     const RENAME_NEW: u32 = 0x00002000;
-    const DATA_OVERWRITE: u32 = 0x00000001;
-    const DATA_EXTEND: u32 = 0x00000002;
-    const DATA_TRUNCATION: u32 = 0x00000004;
 
     if reason & FILE_DELETE != 0 {
         "deleted"
@@ -1056,8 +1058,6 @@ fn classify_reason(reason: u32) -> &'static str {
         "renamed_new"
     } else if reason & FILE_CREATE != 0 {
         "created"
-    } else if reason & (DATA_OVERWRITE | DATA_EXTEND | DATA_TRUNCATION) != 0 {
-        "modified"
     } else {
         "modified"
     }
