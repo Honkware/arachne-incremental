@@ -949,7 +949,7 @@ fn read_usn_deltas(
                         file_name_length / 2,
                     )
                 };
-                let filename = String::from_utf16_lossy(name_slice).into_owned();
+                let filename = String::from_utf16_lossy(name_slice).into();
 
                 all_records.push(UsnRecord {
                     frn,
